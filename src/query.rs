@@ -1,3 +1,9 @@
+// クエリ実行エンジン
+//
+// SQLクエリに相当する実行計画を構築・実行するためのフレームワーク。
+// イテレータパターンとビジターパターンを組み合わせて、
+// 効率的なクエリ実行を提供します。
+
 use anyhow::Result;
 
 use crate::btree::{self, BTree, SearchMode};
@@ -5,20 +11,38 @@ use crate::buffer::BufferPoolManager;
 use crate::disk::PageId;
 use crate::tuple;
 
+/// タプル（レコード）の型エイリアス
+/// 各カラムがVec<u8>として表現される
 pub type Tuple = Vec<Vec<u8>>;
+
+/// タプルスライスの型エイリアス（読み取り専用参照）
 pub type TupleSlice<'a> = &'a [Vec<u8>];
 
+/// タプルレベルの検索モード
+///
+/// B+Tree検索のTupleSearchModeをより高レベルな
+/// タプル操作用に拡張したもの。キーの複数要素を
+/// 組み合わせた検索条件を表現する。
 pub enum TupleSearchMode<'a> {
+    /// 先頭から検索開始
     Start,
+
+    /// 指定されたキー値から検索開始
+    /// 複数要素のキーに対応（複合キー）
     Key(&'a [&'a [u8]]),
 }
 
 impl<'a> TupleSearchMode<'a> {
+    /// TupleSearchModeをB+Tree用のSearchModeに変換する
+    ///
+    /// # Returns
+    /// B+Tree検索で使用するSearchMode
     fn encode(&self) -> SearchMode {
         match self {
             TupleSearchMode::Start => SearchMode::Start,
             TupleSearchMode::Key(tuple) => {
                 let mut key = vec![];
+                // 複数要素をmemcmpableエンコーディングで連結
                 tuple::encode(tuple.iter(), &mut key);
                 SearchMode::Key(key)
             }
@@ -26,23 +50,58 @@ impl<'a> TupleSearchMode<'a> {
     }
 }
 
+/// クエリ実行エンジンのエグゼキュータートレイト
+///
+/// イテレータパターンを実装し、タプルを一つずつ返す。
+/// 各実行ノード（スキャン、フィルタ、結合など）はこのトレイトを実装。
 pub trait Executor {
+    /// 次のタプルを取得する
+    ///
+    /// # Arguments
+    /// * `bufmgr` - バッファプールマネージャー
+    ///
+    /// # Returns
+    /// 次のタプル、または終了時はNone
     fn next(&mut self, bufmgr: &mut BufferPoolManager) -> Result<Option<Tuple>>;
 }
 
+/// ボックス化されたエグゼキュータ（トレイトオブジェクト）
 pub type BoxExecutor<'a> = Box<dyn Executor + 'a>;
 
+/// 実行計画ノードのトレイト
+///
+/// クエリ最適化の結果として生成される実行計画の各ノードを表現。
+/// start()メソッドで実際の実行を開始し、エグゼキュータを返す。
 pub trait PlanNode {
+    /// 実行計画ノードを開始してエグゼキュータを返す
+    ///
+    /// # Arguments
+    /// * `bufmgr` - バッファプールマネージャー
+    ///
+    /// # Returns
+    /// 実行可能なエグゼキュータ
     fn start(&self, bufmgr: &mut BufferPoolManager) -> Result<BoxExecutor>;
 }
 
+/// 順次スキャン（SeqScan）実行計画ノード
+///
+/// テーブル全体またはキー範囲を順次スキャンする。
+/// 条件を満たすタプルのみを返すフィルタ機能も含む。
 pub struct SeqScan<'a> {
+    /// スキャン対象テーブルのメタページID
     pub table_meta_page_id: PageId,
+
+    /// 検索開始位置（Start または Key指定）
     pub search_mode: TupleSearchMode<'a>,
+
+    /// スキャン継続条件（falseになるまでスキャン継続）
     pub while_cond: &'a dyn Fn(TupleSlice) -> bool,
 }
 
 impl<'a> PlanNode for SeqScan<'a> {
+    /// SeqScan実行計画を開始する
+    ///
+    /// B+Treeイテレータを作成し、ExecSeqScanエグゼキュータでラップする。
     fn start(&self, bufmgr: &mut BufferPoolManager) -> Result<BoxExecutor> {
         let btree = BTree::new(self.table_meta_page_id);
         let table_iter = btree.search(bufmgr, self.search_mode.encode())?;
