@@ -153,11 +153,25 @@ impl BufferPool {
         Some(victim_id)
     }
 
+    /// Clock-Sweepアルゴリズム用のバッファIDを次の位置に進める
+    ///
+    /// バッファプールのサイズを超える場合は先頭に戻る（循環）。
+    /// このメソッドによりClock-Sweepアルゴリズムの時計針が進む。
+    ///
+    /// # Arguments
+    /// * `buffer_id` - 現在のバッファID
+    ///
+    /// # Returns
+    /// 次の位置のバッファID
     fn increment_id(&self, buffer_id: BufferId) -> BufferId {
         BufferId((buffer_id.0 + 1) % self.size())
     }
 }
 
+/// BufferIdによるBufferPoolへの読み取り専用アクセスを提供
+///
+/// BufferIdをバッファプール内の配列インデックスとして使用し、
+/// 対応するFrameへの参照を返す。型安全性を保ちつつ効率的なアクセスを実現。
 impl Index<BufferId> for BufferPool {
     type Output = Frame;
 
@@ -166,19 +180,46 @@ impl Index<BufferId> for BufferPool {
     }
 }
 
+/// BufferIdによるBufferPoolへの可変アクセスを提供
+///
+/// 読み取り専用アクセスに加えて、Frameの内容変更を可能にする。
+/// usage_countの更新やバッファの置換処理で使用される。
 impl IndexMut<BufferId> for BufferPool {
     fn index_mut(&mut self, index: BufferId) -> &mut Self::Output {
         &mut self.buffers[index.0]
     }
 }
 
+/// バッファプールマネージャー
+///
+/// ディスクマネージャーとバッファプールを組み合わせて、
+/// ページレベルでのキャッシュ管理を行う高レベルインターフェース。
+/// ページテーブル（PageId -> BufferId のマッピング）を管理し、
+/// アプリケーションからのページ要求を効率的に処理する。
 pub struct BufferPoolManager {
+    /// ディスクI/O操作を担当するマネージャー
     disk: DiskManager,
+
+    /// メモリ内のページキャッシュプール
     pool: BufferPool,
+
+    /// ページIDからバッファIDへのマッピングテーブル
+    /// どのページがどのバッファに格納されているかを追跡
     page_table: HashMap<PageId, BufferId>,
 }
 
 impl BufferPoolManager {
+    /// 新しいバッファプールマネージャーを作成する
+    ///
+    /// ディスクマネージャーとバッファプールを受け取り、
+    /// 空のページテーブルと組み合わせて初期化する。
+    ///
+    /// # Arguments
+    /// * `disk` - ディスクI/O操作を行うマネージャー
+    /// * `pool` - メモリ内ページキャッシュプール
+    ///
+    /// # Returns
+    /// 初期化されたBufferPoolManagerインスタンス
     pub fn new(disk: DiskManager, pool: BufferPool) -> Self {
         let page_table = HashMap::new();
         Self {
@@ -188,62 +229,143 @@ impl BufferPoolManager {
         }
     }
 
+    /// 指定されたページIDのページをバッファプールから取得する
+    ///
+    /// ページがすでにバッファプールに存在する場合は使用カウンタを増やして返す。
+    /// 存在しない場合は以下の手順でページを読み込む：
+    /// 1. Clock-Sweepアルゴリズムで置換対象バッファを選択
+    /// 2. 置換対象バッファがダーティな場合はディスクに書き戻し
+    /// 3. 新しいページをディスクから読み込み
+    /// 4. ページテーブルを更新
+    ///
+    /// # Arguments
+    /// * `page_id` - 取得するページのID
+    ///
+    /// # Returns
+    /// 成功時はページバッファへの参照カウンタ、失敗時はエラー
+    ///
+    /// # Errors
+    /// * `Error::NoFreeBuffer` - 全てのバッファが使用中の場合
+    /// * `Error::Io` - ディスクI/Oエラーが発生した場合
     pub fn fetch_page(&mut self, page_id: PageId) -> Result<Rc<Buffer>, Error> {
+        // ページテーブルで既存バッファを確認し、あれば使用カウンタを増やして返す
         if let Some(&buffer_id) = self.page_table.get(&page_id) {
             let frame = &mut self.pool[buffer_id];
             frame.usage_count += 1;
             return Ok(Rc::clone(&frame.buffer));
         }
+
+        // 置換対象バッファを選択
         let buffer_id = self.pool.evict().ok_or(Error::NoFreeBuffer)?;
         let frame = &mut self.pool[buffer_id];
         let evict_page_id = frame.buffer.page_id;
+
         {
             let buffer = Rc::get_mut(&mut frame.buffer).unwrap();
+            // ダーティページの書き戻し
             if buffer.is_dirty.get() {
                 self.disk
                     .write_page_data(evict_page_id, buffer.page.get_mut())?;
             }
+
+            // 新しいページの読み込み
             buffer.page_id = page_id;
             buffer.is_dirty.set(false);
             self.disk.read_page_data(page_id, buffer.page.get_mut())?;
             frame.usage_count = 1;
         }
+
         let page = Rc::clone(&frame.buffer);
+        // ページテーブルの更新
         self.page_table.remove(&evict_page_id);
         self.page_table.insert(page_id, buffer_id);
         Ok(page)
     }
 
+    /// 新しいページを作成してバッファプールに追加する
+    ///
+    /// ディスクマネージャーから新しいページIDを割り当て、
+    /// バッファプール内に空のページを作成する。以下の手順で実行：
+    /// 1. Clock-Sweepアルゴリズムで置換対象バッファを選択
+    /// 2. 置換対象バッファがダーティな場合はディスクに書き戻し
+    /// 3. 新しいページIDを割り当て
+    /// 4. バッファを初期化してダーティフラグを設定
+    /// 5. ページテーブルを更新
+    ///
+    /// # Arguments
+    /// なし
+    ///
+    /// # Returns
+    /// 成功時は新しいページバッファへの参照カウンタ、失敗時はエラー
+    ///
+    /// # Errors
+    /// * `Error::NoFreeBuffer` - 全てのバッファが使用中の場合
+    /// * `Error::Io` - ディスクI/Oエラーが発生した場合
     pub fn create_page(&mut self) -> Result<Rc<Buffer>, Error> {
+        // 置換対象バッファを選択
         let buffer_id = self.pool.evict().ok_or(Error::NoFreeBuffer)?;
         let frame = &mut self.pool[buffer_id];
         let evict_page_id = frame.buffer.page_id;
+
         let page_id = {
             let buffer = Rc::get_mut(&mut frame.buffer).unwrap();
+            // ダーティページの書き戻し
             if buffer.is_dirty.get() {
                 self.disk
                     .write_page_data(evict_page_id, buffer.page.get_mut())?;
             }
+
+            // 新しいページIDを割り当て
             let page_id = self.disk.allocate_page();
             *buffer = Buffer::default();
             buffer.page_id = page_id;
-            buffer.is_dirty.set(true);
+            buffer.is_dirty.set(true); // 新規作成なのでダーティフラグを設定
             frame.usage_count = 1;
             page_id
         };
+
         let page = Rc::clone(&frame.buffer);
+        // ページテーブルの更新
         self.page_table.remove(&evict_page_id);
         self.page_table.insert(page_id, buffer_id);
         Ok(page)
     }
 
+    /// バッファプール内の全ダーティページをディスクに書き戻す
+    ///
+    /// データベースの一貫性を保つため、メモリ内で変更された
+    /// 全てのページを強制的にディスクに書き戻す。以下の手順で実行：
+    /// 1. ページテーブル内の全エントリを走査
+    /// 2. 各バッファのダーティフラグをチェック
+    /// 3. ダーティなページをディスクに書き込み
+    /// 4. ダーティフラグをクリア
+    /// 5. ディスクの同期処理を実行
+    ///
+    /// # Arguments
+    /// なし
+    ///
+    /// # Returns
+    /// 成功時は()、失敗時はディスクI/Oエラー
+    ///
+    /// # Errors
+    /// * `Error::Io` - ディスクI/Oエラーが発生した場合
+    ///
+    /// # Examples
+    /// ```
+    /// // トランザクションコミット時に呼び出し
+    /// bufmgr.flush()?;
+    /// ```
     pub fn flush(&mut self) -> Result<(), Error> {
+        // 全ページテーブルエントリを走査
         for (&page_id, &buffer_id) in self.page_table.iter() {
             let frame = &self.pool[buffer_id];
             let mut page = frame.buffer.page.borrow_mut();
+            // ページをディスクに書き込み
             self.disk.write_page_data(page_id, page.as_mut())?;
+            // ダーティフラグをクリア
             frame.buffer.is_dirty.set(false);
         }
+        // ディスクの同期処理
         self.disk.sync()?;
         Ok(())
     }
