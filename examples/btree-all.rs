@@ -5,7 +5,7 @@ use relly::buffer::{BufferPool, BufferPoolManager};
 use relly::disk::{DiskManager, PageId};
 
 fn main() -> Result<()> {
-    let disk = DiskManager::open("test.btr")?;
+    let disk = DiskManager::open("simple.rly")?;
     let pool = BufferPool::new(10);
     let mut bufmgr = BufferPoolManager::new(disk, pool);
 
